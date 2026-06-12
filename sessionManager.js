@@ -5,7 +5,7 @@ import {
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
 } from '@whiskeysockets/baileys';
-import { readdir } from 'fs/promises';
+import { readdir, rm } from 'fs/promises';
 import { existsSync } from 'fs';
 import pino from 'pino';
 import QRCode from 'qrcode';
@@ -17,6 +17,16 @@ const logger = pino({ level: 'silent' });
 const sessions = new Map();
 
 const LARAVEL_WEBHOOK = process.env.LARAVEL_WEBHOOK_URL || 'http://localhost:8000/api/whatsapp/webhook';
+
+// Delete the stored multi-file auth state for a user so the next session
+// start generates a fresh QR instead of reusing invalid credentials.
+async function clearAuth(userId) {
+    try {
+        await rm(`auth/${userId}`, { recursive: true, force: true });
+    } catch {
+        // Folder may not exist — ignore
+    }
+}
 
 async function notifyLaravel(userId, status, phone = null) {
     try {
@@ -82,12 +92,18 @@ export async function startSession(userId, io) {
             const loggedOut = statusCode === DisconnectReason.loggedOut;
 
             if (loggedOut) {
-                session.status = 'disconnected';
-                session.qr = null;
-                session.phone = null;
-                io.emit(`whatsapp-status-${userId}`, { status: 'disconnected' });
+                // User logged out from their phone — stored credentials are now
+                // invalid. Wipe them and start a clean session so a fresh QR is
+                // generated for re-login (otherwise it gets stuck "restarting").
+                io.emit(`whatsapp-status-${userId}`, { status: 'connecting' });
                 await notifyLaravel(userId, 'disconnected');
+
+                try { sock.ev.removeAllListeners('connection.update'); } catch { /* ignore */ }
                 sessions.delete(userId);
+                await clearAuth(userId);
+
+                // Re-initialise with no creds → emits a new QR automatically
+                setTimeout(() => startSession(userId, io).catch(console.error), 1000);
             } else {
                 // Reconnect for all other close reasons
                 session.status = 'connecting';
