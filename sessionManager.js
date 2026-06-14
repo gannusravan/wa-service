@@ -16,23 +16,38 @@ const logger = pino({ level: 'silent' });
 // Map<userId, { socket, status, phone, qr }>
 const sessions = new Map();
 
-const LARAVEL_WEBHOOK = process.env.LARAVEL_WEBHOOK_URL || 'http://localhost:8000/api/whatsapp/webhook';
+// Backend webhook the service POSTs connection/inbound events to. Works with
+// any stack (Laravel, MERN/Express, Django, etc.) — it's just an HTTP endpoint.
+// WEBHOOK_URL is the generic name; LARAVEL_WEBHOOK_URL is kept for backward compat.
+const WEBHOOK_URL = process.env.WEBHOOK_URL || process.env.LARAVEL_WEBHOOK_URL || '';
+// Optional shared secret sent as X-Webhook-Secret so the backend can verify the
+// request really came from this service.
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+const AUTH_DIR = process.env.AUTH_DIR || 'auth';
 
 // Delete the stored multi-file auth state for a user so the next session
 // start generates a fresh QR instead of reusing invalid credentials.
 async function clearAuth(userId) {
     try {
-        await rm(`auth/${userId}`, { recursive: true, force: true });
+        await rm(`${AUTH_DIR}/${userId}`, { recursive: true, force: true });
     } catch {
         // Folder may not exist — ignore
     }
 }
 
-async function notifyLaravel(userId, status, phone = null) {
+// Notify the backend of a session event. Framework-agnostic JSON payload.
+async function notifyWebhook(event, userId, extra = {}) {
+    if (!WEBHOOK_URL) return; // No backend configured — skip silently
     try {
-        await axios.post(LARAVEL_WEBHOOK, { sessionId: userId, status, phone }, { timeout: 5000 });
+        const headers = { 'Content-Type': 'application/json' };
+        if (WEBHOOK_SECRET) headers['X-Webhook-Secret'] = WEBHOOK_SECRET;
+        await axios.post(
+            WEBHOOK_URL,
+            { event, sessionId: userId, ...extra },
+            { timeout: 5000, headers }
+        );
     } catch {
-        // Laravel may be down — fail silently
+        // Backend may be down — fail silently
     }
 }
 
@@ -50,7 +65,7 @@ export async function startSession(userId, io) {
     sessions.set(userId, { socket: null, status: 'connecting', phone: null, qr: null });
     io.emit(`whatsapp-status-${userId}`, { status: 'connecting' });
 
-    const { state, saveCreds } = await useMultiFileAuthState(`auth/${userId}`);
+    const { state, saveCreds } = await useMultiFileAuthState(`${AUTH_DIR}/${userId}`);
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -71,6 +86,29 @@ export async function startSession(userId, io) {
 
     sock.ev.on('creds.update', saveCreds);
 
+    // Forward inbound messages to the backend webhook so any app can react to
+    // replies. Disabled unless FORWARD_INBOUND=true to avoid surprising existing
+    // send-only deployments.
+    if (process.env.FORWARD_INBOUND === 'true') {
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify') return;
+            for (const msg of messages) {
+                if (msg.key.fromMe) continue;
+                const from = msg.key.remoteJid?.split('@')[0] ?? null;
+                const text =
+                    msg.message?.conversation ??
+                    msg.message?.extendedTextMessage?.text ??
+                    null;
+                await notifyWebhook('message', userId, {
+                    from,
+                    text,
+                    messageId: msg.key.id,
+                    timestamp: msg.messageTimestamp,
+                });
+            }
+        });
+    }
+
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
@@ -88,7 +126,7 @@ export async function startSession(userId, io) {
             const phone = sock.user?.id?.split(':')[0] ?? null;
             session.phone = phone;
             io.emit(`whatsapp-status-${userId}`, { status: 'connected', phone });
-            await notifyLaravel(userId, 'connected', phone);
+            await notifyWebhook('connected', userId, { status: 'connected', phone });
         }
 
         if (connection === 'close') {
@@ -100,7 +138,7 @@ export async function startSession(userId, io) {
                 // invalid. Wipe them and start a clean session so a fresh QR is
                 // generated for re-login (otherwise it gets stuck "restarting").
                 io.emit(`whatsapp-status-${userId}`, { status: 'connecting' });
-                await notifyLaravel(userId, 'disconnected');
+                await notifyWebhook('disconnected', userId, { status: 'disconnected' });
 
                 try { sock.ev.removeAllListeners('connection.update'); } catch { /* ignore */ }
                 sessions.delete(userId);
@@ -134,8 +172,8 @@ export function getSocket(userId) {
 }
 
 export async function restoreAll(io) {
-    if (!existsSync('auth')) return;
-    const entries = await readdir('auth', { withFileTypes: true });
+    if (!existsSync(AUTH_DIR)) return;
+    const entries = await readdir(AUTH_DIR, { withFileTypes: true });
     for (const entry of entries) {
         if (entry.isDirectory()) {
             const userId = entry.name;

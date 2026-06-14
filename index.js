@@ -7,13 +7,27 @@ import { startSession, getStatus, getQr, getSocket, restoreAll } from './session
 const app = express();
 app.use(express.json());
 
-// Allow browser requests from any origin (Laravel frontend → Node.js service)
+// Allow browser requests from your app's frontend → this Node.js service.
+// Set CORS_ORIGIN to lock it down (e.g. https://app.example.com); defaults to *.
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    res.header('Access-Control-Allow-Origin', CORS_ORIGIN);
+    res.header('Access-Control-Allow-Headers', 'Content-Type, X-API-Key');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
+});
+
+// Optional API-key auth. When API_KEY is set, every request must send a matching
+// X-API-Key header (or ?apiKey=). Leave API_KEY unset to keep it open (current
+// behaviour). GET /health is always public.
+const API_KEY = process.env.API_KEY || '';
+app.use((req, res, next) => {
+    if (!API_KEY) return next();
+    if (req.path === '/health') return next();
+    const provided = req.get('X-API-Key') || req.query.apiKey;
+    if (provided === API_KEY) return next();
+    return res.status(401).json({ success: false, message: 'Invalid or missing API key' });
 });
 
 const httpServer = createServer(app);
@@ -51,6 +65,11 @@ io.emit = (event, ...args) => {
 };
 
 // ── REST API ─────────────────────────────────────────────────────────────────
+
+// Health check (always public — useful for uptime monitors / orchestrators)
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', service: 'wa-service', uptime: process.uptime() });
+});
 
 // Start or resume a session
 app.post('/start-session', async (req, res) => {
