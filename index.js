@@ -28,7 +28,18 @@ const PORT = process.env.PORT || 5013;
 
 io.on('connection', (socket) => {
     socket.on('join', (userId) => {
-        socket.join(String(userId));
+        const id = String(userId);
+        socket.join(id);
+
+        // Push the current authoritative state to the freshly (re)loaded page so
+        // a refresh always reflects reality, instead of relying on stale
+        // server-rendered HTML or a change event that already fired.
+        const { status, phone } = getStatus(id);
+        socket.emit(`whatsapp-status-${id}`, { status, phone });
+        if (status !== 'connected') {
+            const qr = getQr(id);
+            if (qr) socket.emit(`whatsapp-qr-${id}`, { qr });
+        }
     });
 });
 

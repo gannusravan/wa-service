@@ -39,8 +39,12 @@ async function notifyLaravel(userId, status, phone = null) {
 export async function startSession(userId, io) {
     if (sessions.has(userId)) {
         const existing = sessions.get(userId);
-        // If already connected, nothing to do
+        // Already connected, or a connection attempt is already in flight with a
+        // live socket — don't spawn a duplicate (mount() calls /start-session on
+        // every page load; a second socket on the same creds triggers a Baileys
+        // conflict that can regenerate the QR).
         if (existing.status === 'connected') return;
+        if (existing.status === 'connecting' && existing.socket) return;
     }
 
     sessions.set(userId, { socket: null, status: 'connecting', phone: null, qr: null });
